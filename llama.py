@@ -61,6 +61,7 @@ class Attention(nn.Module):
                  / math.sqrt(query.size(-1))
 
         if mask is not None:
+            scores = scores.float()
             scores = scores.masked_fill(mask == 0, -1e9)
 
         p_attn = F.softmax(scores, dim=-1)
@@ -181,7 +182,7 @@ class LLaMA(nn.Module):
             raise ValueError(f"Sequence length {seq_len} exceeds max length {self.max_len}")
 
         mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device)).bool()
-        mask = mask.unsqueeze(0).unsqueeze(0)  # (1,1,seq_len,seq_len)
+        mask = mask.unsqueeze(0).unsqueeze(0)
 
         x = self.embed(x)
 
