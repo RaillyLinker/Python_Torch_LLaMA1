@@ -30,24 +30,22 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin):
+def build_rotary_pos_emb(dim, max_seq_len=2048):
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+    t = torch.arange(max_seq_len).float()
+    freqs = torch.einsum('i , j -> i j', t, inv_freq)  # (max_seq_len, dim/2)
+    emb = torch.cat((freqs, freqs), dim=-1)  # (max_seq_len, dim)
+    cos = emb.cos()[None, None, :, :]  # (1, 1, max_seq_len, dim)
+    sin = emb.sin()[None, None, :, :]
+    return cos, sin
+
+
+def apply_rotary_pos_emb_single(q, k, cos, sin, seq_len):
+    cos = cos[:, :, :seq_len, :]
+    sin = sin[:, :, :seq_len, :]
     q_ = (q * cos) + (rotate_half(q) * sin)
     k_ = (k * cos) + (rotate_half(k) * sin)
     return q_, k_
-
-
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_seq_len=2048):
-        super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        t = torch.arange(max_seq_len).float()
-        freqs = torch.einsum('i , j -> i j', t, inv_freq)  # (max_seq_len, dim/2)
-        emb = torch.cat((freqs, freqs), dim=-1)  # (max_seq_len, dim)
-        self.register_buffer('cos', emb.cos()[None, None, :, :])  # (1,1,max_seq_len, dim)
-        self.register_buffer('sin', emb.sin()[None, None, :, :])
-
-    def forward(self, seq_len):
-        return self.cos[:, :, :seq_len, :], self.sin[:, :, :seq_len, :]
 
 
 class Attention(nn.Module):
@@ -72,7 +70,7 @@ class Attention(nn.Module):
 
 
 class MultiHeadedAttention(nn.Module):
-    def __init__(self, h, d_model, dropout=0.1):
+    def __init__(self, h, d_model, dropout=0.1, max_seq_len=2048):
         super().__init__()
         assert d_model % h == 0
 
@@ -83,7 +81,10 @@ class MultiHeadedAttention(nn.Module):
         self.output_linear = nn.Linear(d_model, d_model)
         self.attention = Attention(dropout)
 
-        self.rotary_emb = RotaryEmbedding(self.d_k)
+        # 함수 기반 RoPE 임베딩을 버퍼에 등록
+        cos, sin = build_rotary_pos_emb(self.d_k, max_seq_len)
+        self.register_buffer('cos', cos)
+        self.register_buffer('sin', sin)
 
     def forward(self, query, key, value, mask=None):
         batch_size, seq_len, _ = query.size()
@@ -91,10 +92,8 @@ class MultiHeadedAttention(nn.Module):
         query, key, value = [l(x).view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
                              for l, x in zip(self.linear_layers, (query, key, value))]
 
-        cos, sin = self.rotary_emb(seq_len)
-
         # RoPE 적용
-        query, key = apply_rotary_pos_emb(query, key, cos, sin)
+        query, key = apply_rotary_pos_emb_single(query, key, self.cos, self.sin, seq_len)
 
         x, attn = self.attention(query, key, value, mask=mask)
 
