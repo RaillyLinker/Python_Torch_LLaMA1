@@ -2,47 +2,54 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+from typing import Tuple
 
 
 class TokenEmbedding(nn.Module):
-    def __init__(self, vocab_size, emb_size):
+    def __init__(self, vocab_size: int, emb_size: int):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, emb_size)
         self.scale = math.sqrt(emb_size)
 
-    def forward(self, tokens):
-        return self.embedding(tokens.long()) * self.scale
+    def forward(self, tokens: torch.LongTensor) -> torch.Tensor:
+        # tokens: (batch, seq)
+        # output: (batch, seq, emb_size) scaled by sqrt(emb_size)
+        return self.embedding(tokens) * self.scale
 
 
 class InputEmbedding(nn.Module):
-    def __init__(self, vocab_size, d_model, dropout=0.1):
+    def __init__(self, vocab_size: int, d_model: int, dropout: float = 0.1):
         super().__init__()
         self.token = TokenEmbedding(vocab_size, d_model)
         self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, x):
-        token_emb = self.token(x)
-        return self.dropout(token_emb)
+    def forward(self, x: torch.LongTensor) -> torch.Tensor:
+        # x: (batch, seq)
+        tok_emb = self.token(x)  # (batch, seq, d_model)
+        return self.dropout(tok_emb)
 
 
-def rotate_half(x):
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    # (.., 2*k) -> (.., k), (.., k)
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
 
-def build_rotary_pos_emb(dim, max_seq_len=2048):
-    inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-    t = torch.arange(max_seq_len).float()
-    freqs = torch.einsum('i , j -> i j', t, inv_freq)  # (max_seq_len, dim/2)
-    emb = torch.cat((freqs, freqs), dim=-1)  # (max_seq_len, dim)
-    cos = emb.cos()[None, None, :, :]  # (1, 1, max_seq_len, dim)
-    sin = emb.sin()[None, None, :, :]
+def build_rotary_pos_emb(dim: int, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    inv_freq = 1.0 / (
+            10000 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+    )
+    t = torch.arange(seq_len, dtype=torch.float32)
+    freqs = torch.einsum("i,j->ij", t, inv_freq)  # (seq_len, dim/2)
+    emb = torch.cat((freqs, freqs), dim=-1)  # (seq_len, dim)
+    cos = emb.cos()[None, None, :, :]  # (1, 1, seq_len, dim)
+    sin = emb.sin()[None, None, :, :]  # (1, 1, seq_len, dim)
     return cos, sin
 
 
-def apply_rotary_pos_emb_single(q, k, cos, sin, seq_len):
-    cos = cos[:, :, :seq_len, :]
-    sin = sin[:, :, :seq_len, :]
+def apply_rotary_pos_emb_single(q, k, cos, sin, seq_len, dtype):
+    cos = cos[:, :, :seq_len, :].to(dtype=dtype)
+    sin = sin[:, :, :seq_len, :].to(dtype=dtype)
     q_ = (q * cos) + (rotate_half(q) * sin)
     k_ = (k * cos) + (rotate_half(k) * sin)
     return q_, k_
@@ -88,12 +95,13 @@ class MultiHeadedAttention(nn.Module):
 
     def forward(self, query, key, value, mask=None):
         batch_size, seq_len, _ = query.size()
+        dtype = query.dtype
 
         query, key, value = [l(x).view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
                              for l, x in zip(self.linear_layers, (query, key, value))]
 
         # RoPE 적용
-        query, key = apply_rotary_pos_emb_single(query, key, self.cos, self.sin, seq_len)
+        query, key = apply_rotary_pos_emb_single(query, key, self.cos, self.sin, seq_len, dtype)
 
         x, attn = self.attention(query, key, value, mask=mask)
 
@@ -103,23 +111,25 @@ class MultiHeadedAttention(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
-    def forward(self, x):
-        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
-        return x / rms * self.weight
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq, dim)
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        return (x / rms) * self.weight
 
 
 class SublayerConnection(nn.Module):
-    def __init__(self, size, dropout):
-        super(SublayerConnection, self).__init__()
+    def __init__(self, size: int, dropout: float):
+        super().__init__()
         self.norm = RMSNorm(size)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, sublayer):
+    def forward(self, x: torch.Tensor, sublayer: callable) -> torch.Tensor:
+        # Pre-norm → sublayer → dropout → residual add
         return x + self.dropout(sublayer(self.norm(x)))
 
 
@@ -127,23 +137,23 @@ class SwiGLU(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x1, x2 = x.chunk(2, dim=-1)
         return x1 * F.silu(x2)
 
 
 class PositionwiseFeedForward(nn.Module):
-    def __init__(self, d_model, d_ff, dropout=0.1):
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
         self.linear1 = nn.Linear(d_model, d_ff * 2, bias=False)
         self.activation = SwiGLU()
         self.linear2 = nn.Linear(d_ff, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        x = self.linear1(x)
-        x = self.activation(x)
-        x = self.linear2(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.linear1(x)  # (batch, seq, d_ff*2)
+        x = self.activation(x)  # (batch, seq, d_ff)
+        x = self.linear2(x)  # (batch, seq, d_model)
         return self.dropout(x)
 
 
